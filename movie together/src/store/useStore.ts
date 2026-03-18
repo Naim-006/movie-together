@@ -50,15 +50,27 @@ export const useStore = create<RoomState>()(
   setVideoStateLocal: (url, isPlaying, currentTime) => 
     set({ videoUrl: url, isPlaying, currentTime }),
 
-  broadcastVideoState: (url, isPlaying, currentTime) => {
+  broadcastVideoState: async (url, isPlaying, currentTime) => {
     const state = get();
+    // 1. Update local state immediately
     state.setVideoStateLocal(url, isPlaying, currentTime);
+
+    // 2. Broadcast to channel for instant low-latency update to active peers
     if (state.channel) {
       state.channel.send({
         type: 'broadcast',
         event: 'video-state',
-        payload: { url, isPlaying, currentTime }
+        payload: { url, isPlaying, currentTime, _senderId: state.deviceId }
       });
+    }
+
+    // 3. Persist to Supabase DB so late joiners can also get the state
+    if (state.roomId) {
+      await supabase.from('rooms').update({
+        video_url: url,
+        is_playing: isPlaying,
+        playback_time: currentTime
+      }).eq('id', state.roomId);
     }
   },
 
@@ -150,12 +162,29 @@ export const useStore = create<RoomState>()(
 
     const channel = supabase.channel(`room:${token}`, {
       config: {
-        broadcast: { self: false }
+        broadcast: { self: true }
       }
     });
 
     channel
+      // PRIMARY: Listen to Postgres DB changes on the rooms table - this is the most reliable sync method
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `token=eq.${token}` }, (payload) => {
+        // This fires for EVERY user including the one who made the change, so we update state
+        // But only set if the new value is different to avoid unnecessary rerenders
+        const newRow = payload.new as any;
+        const cur = get();
+        if (newRow.video_url !== cur.videoUrl || newRow.is_playing !== cur.isPlaying) {
+          set({
+            videoUrl: newRow.video_url,
+            isPlaying: newRow.is_playing,
+            currentTime: newRow.playback_time || 0
+          });
+        }
+      })
+      // SECONDARY: Low-latency broadcast for play/pause so it feels instant (no DB round-trip delay)  
       .on('broadcast', { event: 'video-state' }, (msg) => {
+        // Ignore events we ourselves sent
+        if (msg.payload._senderId === get().deviceId) return;
         set({
           videoUrl: msg.payload.url,
           isPlaying: msg.payload.isPlaying,
